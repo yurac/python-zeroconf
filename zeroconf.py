@@ -27,7 +27,9 @@ __maintainer__ = 'Jakub Stasiak <jakub@stasiak.at>'
 __version__ = '0.15.1'
 __license__ = 'LGPL'
 
+import errno
 import logging
+import platform
 import select
 import socket
 import struct
@@ -53,6 +55,9 @@ log.addHandler(NullHandler())
 
 if log.level == logging.NOTSET:
     log.setLevel(logging.WARN)
+
+IS_OSX = platform.system() == 'Darwin'
+IS_LINUX = platform.system() == 'Linux'
 
 try:
     xrange = xrange
@@ -1261,10 +1266,29 @@ class Zeroconf(object):
             # the SO_REUSE* options have been set, so ignore it
             #
             log.exception('Unknown error, possibly benign: %r', e)
-        # self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
-        #    socket.inet_aton(self.intf) + socket.inet_aton('0.0.0.0'))
-        self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                               socket.inet_aton(_MDNS_ADDR) + socket.inet_aton('0.0.0.0'))
+
+        self.socket.setsockopt(
+            socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+            socket.inet_aton(_MDNS_ADDR) + socket.inet_aton('0.0.0.0'),
+        )
+
+        log.debug('Adding to %r multicast group...', self.intf)
+        try:
+            self.socket.setsockopt(
+                socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                socket.inet_aton(_MDNS_ADDR) + socket.inet_aton(self.intf),
+            )
+        except IOError as e:
+            if not (IS_OSX or IS_LINUX) or e.errno != errno.EADDRINUSE:
+                raise
+            log.debug('Expected failure')
+        else:
+            log.debug('Success')
+
+        log.debug('Setting multicast outgoing interface to %r and 0.0.0.0', self.intf)
+        self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                               socket.inet_aton(self.intf) + socket.inet_aton('0.0.0.0'))
+        log.debug('Success')
 
         self.listeners = []
         self.browsers = []
