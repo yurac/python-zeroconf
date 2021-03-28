@@ -13,10 +13,15 @@ import struct
 import threading
 import time
 import unittest
-import unittest.mock
+import six
+from six import indexbytes, int2byte
+
+try:
+    import unittest.mock as mock
+except ImportError:
+    import mock
+
 from threading import Event
-from typing import Dict, Optional  # noqa # used in type hints
-from typing import cast
 
 import pytest
 
@@ -68,7 +73,7 @@ class TestDunder(unittest.TestCase):
 
     def test_dns_address_repr(self):
         address = r.DNSAddress('irrelevant', r._TYPE_SOA, r._CLASS_IN, 1, b'a')
-        assert repr(address).endswith("b'a'")
+        assert repr(address).endswith("a")
 
         address_ipv4 = r.DNSAddress(
             'irrelevant', r._TYPE_SOA, r._CLASS_IN, 1, socket.inet_pton(socket.AF_INET, '127.0.0.1')
@@ -169,7 +174,7 @@ class PacketGeneration(unittest.TestCase):
         generated = r.DNSOutgoing(r._FLAGS_QR_RESPONSE)
         generated.add_answer_at_time(
             r.DNSService(
-                "æøå.local.",
+                u"æøå.local.",
                 r._TYPE_SRV,
                 r._CLASS_IN | r._CLASS_UNIQUE,
                 r._DNS_HOST_TTL,
@@ -264,7 +269,7 @@ class PacketGeneration(unittest.TestCase):
         generated = r.DNSOutgoing(0)
         generated.add_additional_answer(DNSHinfo('irrelevant', r._TYPE_HINFO, 0, 0, 'cpu', 'os'))
         parsed = r.DNSIncoming(generated.packet())
-        answer = cast(r.DNSHinfo, parsed.answers[0])
+        answer = parsed.answers[0]
         assert answer.cpu == u'cpu'
         assert answer.os == u'os'
 
@@ -278,19 +283,19 @@ class PacketForm(unittest.TestCase):
         """ID must be zero in a DNS-SD packet"""
         generated = r.DNSOutgoing(r._FLAGS_QR_QUERY)
         bytes = generated.packet()
-        id = bytes[0] << 8 | bytes[1]
+        id = indexbytes(bytes, 0) << 8 | indexbytes(bytes, 1)
         assert id == 0
 
     def test_query_header_bits(self):
         generated = r.DNSOutgoing(r._FLAGS_QR_QUERY)
         bytes = generated.packet()
-        flags = bytes[2] << 8 | bytes[3]
+        flags = indexbytes(bytes, 2) << 8 | indexbytes(bytes, 3)
         assert flags == 0x0
 
     def test_response_header_bits(self):
         generated = r.DNSOutgoing(r._FLAGS_QR_RESPONSE)
         bytes = generated.packet()
-        flags = bytes[2] << 8 | bytes[3]
+        flags = indexbytes(bytes, 2) << 8 | indexbytes(bytes, 3)
         assert flags == 0x8000
 
     def test_numbers(self):
@@ -370,16 +375,18 @@ class Names(unittest.TestCase):
         # we are going to monkey patch the zeroconf send to check packet sizes
         old_send = zc.send
 
-        longest_packet_len = 0
-        longest_packet = None  # type: Optional[r.DNSOutgoing]
+        class TestCtx(object):
+            def __init__(self):
+                self.longest_packet_len = 0
+                self.longest_packet = None
+        testCtx = TestCtx()
 
         def send(out, addr=r._MDNS_ADDR, port=r._MDNS_PORT):
             """Sends an outgoing packet."""
             for packet in out.packets():
-                nonlocal longest_packet_len, longest_packet
-                if longest_packet_len < len(packet):
-                    longest_packet_len = len(packet)
-                    longest_packet = out
+                if testCtx.longest_packet_len < len(packet):
+                    testCtx.longest_packet_len= len(packet)
+                    testCtx.longest_packet = out
                 old_send(out, addr=addr, port=port)
 
         # monkey patch the zeroconf send
@@ -397,7 +404,7 @@ class Names(unittest.TestCase):
         # we will never get to this large of a packet given the application-layer
         # splitting of packets, but we still want to track the longest_packet_len
         # for the debug message below
-        while sleep_count < 100 and longest_packet_len < r._MAX_MSG_ABSOLUTE - 100:
+        while sleep_count < 100 and testCtx.longest_packet_len < r._MAX_MSG_ABSOLUTE - 100:
             sleep_count += 1
             time.sleep(0.1)
 
@@ -406,23 +413,21 @@ class Names(unittest.TestCase):
 
         import zeroconf
 
-        zeroconf.log.debug('sleep_count %d, sized %d', sleep_count, longest_packet_len)
+        zeroconf.log.debug('sleep_count %d, sized %d', sleep_count, testCtx.longest_packet_len)
 
         # now the browser has sent at least one request, verify the size
-        assert longest_packet_len <= r._MAX_MSG_TYPICAL
-        assert longest_packet_len >= r._MAX_MSG_TYPICAL - 100
+        assert testCtx.longest_packet_len <= r._MAX_MSG_TYPICAL
+        assert testCtx.longest_packet_len >= r._MAX_MSG_TYPICAL - 100
 
         # mock zeroconf's logger warning() and debug()
-        from unittest.mock import patch
-
-        patch_warn = patch('zeroconf.log.warning')
-        patch_debug = patch('zeroconf.log.debug')
+        patch_warn = mock.patch('zeroconf.log.warning')
+        patch_debug = mock.patch('zeroconf.log.debug')
         mocked_log_warn = patch_warn.start()
         mocked_log_debug = patch_debug.start()
 
         # now that we have a long packet in our possession, let's verify the
         # exception handling.
-        out = longest_packet
+        out = testCtx.longest_packet
         assert out is not None
         out.data.append(b'\0' * 1000)
 
@@ -545,7 +550,7 @@ class Framework(unittest.TestCase):
         rv.close()
 
     def test_handle_response(self):
-        def mock_incoming_msg(service_state_change: r.ServiceStateChange) -> r.DNSIncoming:
+        def mock_incoming_msg(service_state_change):
             ttl = 120
             generated = r.DNSOutgoing(r._FLAGS_QR_RESPONSE)
 
@@ -596,7 +601,7 @@ class Framework(unittest.TestCase):
             zeroconf.handle_response(mock_incoming_msg(r.ServiceStateChange.Added))
             dns_text = zeroconf.cache.get_by_details(service_name, r._TYPE_TXT, r._CLASS_IN)
             assert dns_text is not None
-            assert cast(DNSText, dns_text).text == service_text  # service_text is b'path=/~paulsm/'
+            assert dns_text.text == service_text  # service_text is b'path=/~paulsm/'
 
             # https://tools.ietf.org/html/rfc6762#section-10.2
             # Instead of merging this new record additively into the cache in addition
@@ -611,7 +616,7 @@ class Framework(unittest.TestCase):
             zeroconf.handle_response(mock_incoming_msg(r.ServiceStateChange.Updated))
             dns_text = zeroconf.cache.get_by_details(service_name, r._TYPE_TXT, r._CLASS_IN)
             assert dns_text is not None
-            assert cast(DNSText, dns_text).text == service_text  # service_text is b'path=/~humingchun/'
+            assert dns_text.text == service_text  # service_text is b'path=/~humingchun/'
 
             time.sleep(1.1)
 
@@ -626,7 +631,7 @@ class Framework(unittest.TestCase):
 
 class Exceptions(unittest.TestCase):
 
-    browser = None  # type: Zeroconf
+    browser = None
 
     @classmethod
     def setUpClass(cls):
@@ -739,7 +744,8 @@ class Exceptions(unittest.TestCase):
 
         bad = ('127.0.0.1', '::1', 42)
         for addr in bad:
-            self.assertRaisesRegex(
+            six.assertRaisesRegex(
+                self,
                 TypeError,
                 'Addresses must be bytes',
                 ServiceInfo,
@@ -807,7 +813,12 @@ class TestRegistrar(unittest.TestCase):
         # we are going to monkey patch the zeroconf send to check packet sizes
         old_send = zc.send
 
-        nbr_answers = nbr_additionals = nbr_authorities = 0
+        class TestCtx(object):
+            def __init__(self):
+                self.nbr_answers = 0
+                self.nbr_additionals = 0
+                self.nbr_authorities = 0
+        testCtx = TestCtx()
 
         def get_ttl(record_type):
             if expected_ttl is not None:
@@ -819,16 +830,14 @@ class TestRegistrar(unittest.TestCase):
 
         def send(out, addr=r._MDNS_ADDR, port=r._MDNS_PORT):
             """Sends an outgoing packet."""
-            nonlocal nbr_answers, nbr_additionals, nbr_authorities
-
             for answer, time_ in out.answers:
-                nbr_answers += 1
+                testCtx.nbr_answers += 1
                 assert answer.ttl == get_ttl(answer.type)
             for answer in out.additionals:
-                nbr_additionals += 1
+                testCtx.nbr_additionals += 1
                 assert answer.ttl == get_ttl(answer.type)
             for answer in out.authorities:
-                nbr_authorities += 1
+                testCtx.nbr_authorities += 1
                 assert answer.ttl == get_ttl(answer.type)
             old_send(out, addr=addr, port=port)
 
@@ -838,8 +847,8 @@ class TestRegistrar(unittest.TestCase):
         # register service with default TTL
         expected_ttl = None
         zc.register_service(info)
-        assert nbr_answers == 12 and nbr_additionals == 0 and nbr_authorities == 3
-        nbr_answers = nbr_additionals = nbr_authorities = 0
+        assert testCtx.nbr_answers == 12 and testCtx.nbr_additionals == 0 and testCtx.nbr_authorities == 3
+        testCtx.nbr_answers = testCtx.nbr_additionals = testCtx.nbr_authorities = 0
 
         # query
         query = r.DNSOutgoing(r._FLAGS_QR_QUERY | r._FLAGS_AA)
@@ -848,21 +857,21 @@ class TestRegistrar(unittest.TestCase):
         query.add_question(r.DNSQuestion(info.name, r._TYPE_TXT, r._CLASS_IN))
         query.add_question(r.DNSQuestion(info.server, r._TYPE_A, r._CLASS_IN))
         zc.handle_query(r.DNSIncoming(query.packet()), r._MDNS_ADDR, r._MDNS_PORT)
-        assert nbr_answers == 4 and nbr_additionals == 4 and nbr_authorities == 0
-        nbr_answers = nbr_additionals = nbr_authorities = 0
+        assert testCtx.nbr_answers == 4 and testCtx.nbr_additionals == 4 and testCtx.nbr_authorities == 0
+        testCtx.nbr_answers = testCtx.nbr_additionals = testCtx.nbr_authorities = 0
 
         # unregister
         expected_ttl = 0
         zc.unregister_service(info)
-        assert nbr_answers == 12 and nbr_additionals == 0 and nbr_authorities == 0
-        nbr_answers = nbr_additionals = nbr_authorities = 0
+        assert testCtx.nbr_answers == 12 and testCtx.nbr_additionals == 0 and testCtx.nbr_authorities == 0
+        testCtx.nbr_answers = testCtx.nbr_additionals = testCtx.nbr_authorities = 0
 
         # register service with custom TTL
         expected_ttl = r._DNS_HOST_TTL * 2
         assert expected_ttl != r._DNS_HOST_TTL
         zc.register_service(info, ttl=expected_ttl)
-        assert nbr_answers == 12 and nbr_additionals == 0 and nbr_authorities == 3
-        nbr_answers = nbr_additionals = nbr_authorities = 0
+        assert testCtx.nbr_answers == 12 and testCtx.nbr_additionals == 0 and testCtx.nbr_authorities == 3
+        testCtx.nbr_answers = testCtx.nbr_additionals = testCtx.nbr_authorities = 0
 
         # query
         query = r.DNSOutgoing(r._FLAGS_QR_QUERY | r._FLAGS_AA)
@@ -871,15 +880,17 @@ class TestRegistrar(unittest.TestCase):
         query.add_question(r.DNSQuestion(info.name, r._TYPE_TXT, r._CLASS_IN))
         query.add_question(r.DNSQuestion(info.server, r._TYPE_A, r._CLASS_IN))
         zc.handle_query(r.DNSIncoming(query.packet()), r._MDNS_ADDR, r._MDNS_PORT)
-        assert nbr_answers == 4 and nbr_additionals == 4 and nbr_authorities == 0
-        nbr_answers = nbr_additionals = nbr_authorities = 0
+        assert testCtx.nbr_answers == 4 and testCtx.nbr_additionals == 4 and testCtx.nbr_authorities == 0
+        testCtx.nbr_answers = testCtx.nbr_additionals = testCtx.nbr_authorities = 0
 
         # unregister
         expected_ttl = 0
         zc.unregister_service(info)
-        assert nbr_answers == 12 and nbr_additionals == 0 and nbr_authorities == 0
-        nbr_answers = nbr_additionals = nbr_authorities = 0
+        assert testCtx.nbr_answers == 12 and testCtx.nbr_additionals == 0 and testCtx.nbr_authorities == 0
+        testCtx.nbr_answers = testCtx.nbr_additionals = testCtx.nbr_authorities = 0
 
+        # close
+        zc.close()
 
 class TestServiceRegistry(unittest.TestCase):
     def test_only_register_once(self):
@@ -989,7 +1000,7 @@ class TestReaper(unittest.TestCase):
         zeroconf.cache.add(record_with_10s_ttl)
         zeroconf.cache.add(record_with_1s_ttl)
         entries_with_cache = zeroconf.cache.entries()
-        with unittest.mock.patch("zeroconf.DNSCache.iterable_entries", side_effect=RuntimeError):
+        with mock.patch("zeroconf.DNSCache.iterable_entries", side_effect=RuntimeError):
             time.sleep(1.05)
             zeroconf.notify_reaper()
             time.sleep(0.05)
@@ -1140,7 +1151,8 @@ class ListenerTest(unittest.TestCase):
         subtype_name = "My special Subtype"
         type_ = "_http._tcp.local."
         subtype = subtype_name + "._sub." + type_
-        name = "xxxyyyæøå"
+        # Should use the "u" prefix so it works in both python2 and python3
+        name = u"xxxyyyæøå"
         registration_name = "%s.%s" % (name, subtype)
 
         class MyListener(r.ServiceListener):
@@ -1178,7 +1190,7 @@ class ListenerTest(unittest.TestCase):
         )
 
         zeroconf_registrar = Zeroconf(interfaces=['127.0.0.1'])
-        desc = {'path': '/~paulsm/'}  # type: Dict
+        desc = {'path': '/~paulsm/'}
         desc.update(properties)
         addresses = [socket.inet_aton("10.0.1.2")]
         if socket.has_ipv6 and not os.environ.get('SKIP_IPV6'):
@@ -1257,34 +1269,35 @@ class TestServiceBrowser(unittest.TestCase):
         service_text = b'path=/~matt1/'
         service_address = '10.0.1.2'
 
-        service_added_count = 0
-        service_removed_count = 0
-        service_updated_count = 0
+        class TestCtx(object):
+            def __init__(self):
+                self.service_added_count = 0
+                self.service_removed_count = 0
+                self.service_updated_count = 0
+        testCtx = TestCtx()
+
         service_add_event = Event()
         service_removed_event = Event()
         service_updated_event = Event()
 
         class MyServiceListener(r.ServiceListener):
-            def add_service(self, zc, type_, name) -> None:
-                nonlocal service_added_count
-                service_added_count += 1
+            def add_service(self, zc, type_, name):
+                testCtx.service_added_count += 1
                 service_add_event.set()
 
-            def remove_service(self, zc, type_, name) -> None:
-                nonlocal service_removed_count
-                service_removed_count += 1
+            def remove_service(self, zc, type_, name):
+                testCtx.service_removed_count += 1
                 service_removed_event.set()
 
-            def update_service(self, zc, type_, name) -> None:
-                nonlocal service_updated_count
-                service_updated_count += 1
+            def update_service(self, zc, type_, name):
+                testCtx.service_updated_count += 1
                 service_info = zc.get_service_info(type_, name)
                 assert service_info.addresses[0] == socket.inet_aton(service_address)
                 assert service_info.text == service_text
                 assert service_info.server == service_server
                 service_updated_event.set()
 
-        def mock_incoming_msg(service_state_change: r.ServiceStateChange) -> r.DNSIncoming:
+        def mock_incoming_msg(service_state_change):
 
             generated = r.DNSOutgoing(r._FLAGS_QR_RESPONSE)
 
@@ -1330,36 +1343,36 @@ class TestServiceBrowser(unittest.TestCase):
             # service added
             zeroconf.handle_response(mock_incoming_msg(r.ServiceStateChange.Added))
             service_add_event.wait(wait_time)
-            assert service_added_count == 1
-            assert service_updated_count == 0
-            assert service_removed_count == 0
+            assert testCtx.service_added_count == 1
+            assert testCtx.service_updated_count == 0
+            assert testCtx.service_removed_count == 0
 
             # service SRV updated
             service_updated_event.clear()
             service_server = 'ash-2.local.'
             zeroconf.handle_response(mock_incoming_msg(r.ServiceStateChange.Updated))
             service_updated_event.wait(wait_time)
-            assert service_added_count == 1
-            assert service_updated_count == 1
-            assert service_removed_count == 0
+            assert testCtx.service_added_count == 1
+            assert testCtx.service_updated_count == 1
+            assert testCtx.service_removed_count == 0
 
             # service TXT updated
             service_updated_event.clear()
             service_text = b'path=/~matt2/'
             zeroconf.handle_response(mock_incoming_msg(r.ServiceStateChange.Updated))
             service_updated_event.wait(wait_time)
-            assert service_added_count == 1
-            assert service_updated_count == 2
-            assert service_removed_count == 0
+            assert testCtx.service_added_count == 1
+            assert testCtx.service_updated_count == 2
+            assert testCtx.service_removed_count == 0
 
             # service A updated
             service_updated_event.clear()
             service_address = '10.0.1.3'
             zeroconf.handle_response(mock_incoming_msg(r.ServiceStateChange.Updated))
             service_updated_event.wait(wait_time)
-            assert service_added_count == 1
-            assert service_updated_count == 3
-            assert service_removed_count == 0
+            assert testCtx.service_added_count == 1
+            assert testCtx.service_updated_count == 3
+            assert testCtx.service_removed_count == 0
 
             # service all updated
             service_updated_event.clear()
@@ -1368,16 +1381,16 @@ class TestServiceBrowser(unittest.TestCase):
             service_address = '10.0.1.3'
             zeroconf.handle_response(mock_incoming_msg(r.ServiceStateChange.Updated))
             service_updated_event.wait(wait_time)
-            assert service_added_count == 1
-            assert service_updated_count == 4
-            assert service_removed_count == 0
+            assert testCtx.service_added_count == 1
+            assert testCtx.service_updated_count == 4
+            assert testCtx.service_removed_count == 0
 
             # service removed
             zeroconf.handle_response(mock_incoming_msg(r.ServiceStateChange.Removed))
             service_removed_event.wait(wait_time)
-            assert service_added_count == 1
-            assert service_updated_count == 4
-            assert service_removed_count == 1
+            assert testCtx.service_added_count == 1
+            assert testCtx.service_updated_count == 4
+            assert testCtx.service_removed_count == 1
 
         finally:
             assert len(zeroconf.listeners) == 1
@@ -1398,23 +1411,24 @@ class TestServiceInfo(unittest.TestCase):
         service_text = b'path=/~matt1/'
         service_address = '10.0.1.2'
 
-        service_info = None
         send_event = Event()
         service_info_event = Event()
 
-        last_sent = None  # type: Optional[r.DNSOutgoing]
+        class TestCtx(object):
+            def __init__(self):
+                self.last_sent = None
+                self.service_info = None
+        testCtx = TestCtx()
 
         def send(out, addr=r._MDNS_ADDR, port=r._MDNS_PORT):
             """Sends an outgoing packet."""
-            nonlocal last_sent
-
-            last_sent = out
+            testCtx.last_sent = out
             send_event.set()
 
         # monkey patch the zeroconf send
         setattr(zc, "send", send)
 
-        def mock_incoming_msg(records) -> r.DNSIncoming:
+        def mock_incoming_msg(records):
 
             generated = r.DNSOutgoing(r._FLAGS_QR_RESPONSE)
 
@@ -1424,8 +1438,7 @@ class TestServiceInfo(unittest.TestCase):
             return r.DNSIncoming(generated.packet())
 
         def get_service_info_helper(zc, type, name):
-            nonlocal service_info
-            service_info = zc.get_service_info(type, name)
+            testCtx.service_info = zc.get_service_info(type, name)
             service_info_event.set()
 
         try:
@@ -1438,16 +1451,16 @@ class TestServiceInfo(unittest.TestCase):
 
             # Expext query for SRV, TXT, A, AAAA
             send_event.wait(wait_time)
-            assert last_sent is not None
-            assert len(last_sent.questions) == 4
-            assert r.DNSQuestion(service_name, r._TYPE_SRV, r._CLASS_IN) in last_sent.questions
-            assert r.DNSQuestion(service_name, r._TYPE_TXT, r._CLASS_IN) in last_sent.questions
-            assert r.DNSQuestion(service_name, r._TYPE_A, r._CLASS_IN) in last_sent.questions
-            assert r.DNSQuestion(service_name, r._TYPE_AAAA, r._CLASS_IN) in last_sent.questions
-            assert service_info is None
+            assert testCtx.last_sent is not None
+            assert len(testCtx.last_sent.questions) == 4
+            assert r.DNSQuestion(service_name, r._TYPE_SRV, r._CLASS_IN) in testCtx.last_sent.questions
+            assert r.DNSQuestion(service_name, r._TYPE_TXT, r._CLASS_IN) in testCtx.last_sent.questions
+            assert r.DNSQuestion(service_name, r._TYPE_A, r._CLASS_IN) in testCtx.last_sent.questions
+            assert r.DNSQuestion(service_name, r._TYPE_AAAA, r._CLASS_IN) in testCtx.last_sent.questions
+            assert testCtx.service_info is None
 
             # Expext query for SRV, A, AAAA
-            last_sent = None
+            testCtx.last_sent = None
             send_event.clear()
             zc.handle_response(
                 mock_incoming_msg(
@@ -1455,15 +1468,15 @@ class TestServiceInfo(unittest.TestCase):
                 )
             )
             send_event.wait(wait_time)
-            assert last_sent is not None
-            assert len(last_sent.questions) == 3
-            assert r.DNSQuestion(service_name, r._TYPE_SRV, r._CLASS_IN) in last_sent.questions
-            assert r.DNSQuestion(service_name, r._TYPE_A, r._CLASS_IN) in last_sent.questions
-            assert r.DNSQuestion(service_name, r._TYPE_AAAA, r._CLASS_IN) in last_sent.questions
-            assert service_info is None
+            assert testCtx.last_sent is not None
+            assert len(testCtx.last_sent.questions) == 3
+            assert r.DNSQuestion(service_name, r._TYPE_SRV, r._CLASS_IN) in testCtx.last_sent.questions
+            assert r.DNSQuestion(service_name, r._TYPE_A, r._CLASS_IN) in testCtx.last_sent.questions
+            assert r.DNSQuestion(service_name, r._TYPE_AAAA, r._CLASS_IN) in testCtx.last_sent.questions
+            assert testCtx.service_info is None
 
             # Expext query for A, AAAA
-            last_sent = None
+            testCtx.last_sent = None
             send_event.clear()
             zc.handle_response(
                 mock_incoming_msg(
@@ -1482,15 +1495,15 @@ class TestServiceInfo(unittest.TestCase):
                 )
             )
             send_event.wait(wait_time)
-            assert last_sent is not None
-            assert len(last_sent.questions) == 2
-            assert r.DNSQuestion(service_server, r._TYPE_A, r._CLASS_IN) in last_sent.questions
-            assert r.DNSQuestion(service_server, r._TYPE_AAAA, r._CLASS_IN) in last_sent.questions
-            last_sent = None
-            assert service_info is None
+            assert testCtx.last_sent is not None
+            assert len(testCtx.last_sent.questions) == 2
+            assert r.DNSQuestion(service_server, r._TYPE_A, r._CLASS_IN) in testCtx.last_sent.questions
+            assert r.DNSQuestion(service_server, r._TYPE_AAAA, r._CLASS_IN) in testCtx.last_sent.questions
+            testCtx.last_sent = None
+            assert testCtx.service_info is None
 
             # Expext no further queries
-            last_sent = None
+            testCtx.last_sent = None
             send_event.clear()
             zc.handle_response(
                 mock_incoming_msg(
@@ -1506,8 +1519,8 @@ class TestServiceInfo(unittest.TestCase):
                 )
             )
             send_event.wait(wait_time)
-            assert last_sent is None
-            assert service_info is not None
+            assert testCtx.last_sent is None
+            assert testCtx.service_info is not None
 
         finally:
             helper_thread.join()
@@ -1524,23 +1537,24 @@ class TestServiceInfo(unittest.TestCase):
         service_text = b'path=/~matt1/'
         service_address = '10.0.1.2'
 
-        service_info = None
         send_event = Event()
         service_info_event = Event()
 
-        last_sent = None  # type: Optional[r.DNSOutgoing]
+        class TestCtx(object):
+            def __init__(self):
+                self.last_sent = None
+                self.service_info = None
+        testCtx = TestCtx()
 
         def send(out, addr=r._MDNS_ADDR, port=r._MDNS_PORT):
             """Sends an outgoing packet."""
-            nonlocal last_sent
-
-            last_sent = out
+            testCtx.last_sent = out
             send_event.set()
 
         # monkey patch the zeroconf send
         setattr(zc, "send", send)
 
-        def mock_incoming_msg(records) -> r.DNSIncoming:
+        def mock_incoming_msg(records):
 
             generated = r.DNSOutgoing(r._FLAGS_QR_RESPONSE)
 
@@ -1550,8 +1564,7 @@ class TestServiceInfo(unittest.TestCase):
             return r.DNSIncoming(generated.packet())
 
         def get_service_info_helper(zc, type, name):
-            nonlocal service_info
-            service_info = zc.get_service_info(type, name)
+            testCtx.service_info = zc.get_service_info(type, name)
             service_info_event.set()
 
         try:
@@ -1564,16 +1577,16 @@ class TestServiceInfo(unittest.TestCase):
 
             # Expext query for SRV, TXT, A, AAAA
             send_event.wait(wait_time)
-            assert last_sent is not None
-            assert len(last_sent.questions) == 4
-            assert r.DNSQuestion(service_name, r._TYPE_SRV, r._CLASS_IN) in last_sent.questions
-            assert r.DNSQuestion(service_name, r._TYPE_TXT, r._CLASS_IN) in last_sent.questions
-            assert r.DNSQuestion(service_name, r._TYPE_A, r._CLASS_IN) in last_sent.questions
-            assert r.DNSQuestion(service_name, r._TYPE_AAAA, r._CLASS_IN) in last_sent.questions
-            assert service_info is None
+            assert testCtx.last_sent is not None
+            assert len(testCtx.last_sent.questions) == 4
+            assert r.DNSQuestion(service_name, r._TYPE_SRV, r._CLASS_IN) in testCtx.last_sent.questions
+            assert r.DNSQuestion(service_name, r._TYPE_TXT, r._CLASS_IN) in testCtx.last_sent.questions
+            assert r.DNSQuestion(service_name, r._TYPE_A, r._CLASS_IN) in testCtx.last_sent.questions
+            assert r.DNSQuestion(service_name, r._TYPE_AAAA, r._CLASS_IN) in testCtx.last_sent.questions
+            assert testCtx.service_info is None
 
             # Expext no further queries
-            last_sent = None
+            testCtx.last_sent = None
             send_event.clear()
             zc.handle_response(
                 mock_incoming_msg(
@@ -1602,8 +1615,8 @@ class TestServiceInfo(unittest.TestCase):
                 )
             )
             send_event.wait(wait_time)
-            assert last_sent is None
-            assert service_info is not None
+            assert testCtx.last_sent is None
+            assert testCtx.service_info is not None
 
         finally:
             helper_thread.join()
@@ -1617,27 +1630,28 @@ class TestServiceBrowserMultipleTypes(unittest.TestCase):
         service_names = ['name2._type2._tcp.local.', 'name._type._tcp.local.', 'name._type._udp.local']
         service_types = ['_type2._tcp.local.', '_type._tcp.local.', '_type._udp.local.']
 
-        service_added_count = 0
-        service_removed_count = 0
+        class TestCtx(object):
+            def __init__(self):
+                self.service_added_count = 0
+                self.service_removed_count = 0
+                self.called_with_refresh_time_check = False
+        testCtx = TestCtx()
+
         service_add_event = Event()
         service_removed_event = Event()
 
         class MyServiceListener(r.ServiceListener):
-            def add_service(self, zc, type_, name) -> None:
-                nonlocal service_added_count
-                service_added_count += 1
-                if service_added_count == 3:
+            def add_service(self, zc, type_, name):
+                testCtx.service_added_count += 1
+                if testCtx.service_added_count == 3:
                     service_add_event.set()
 
-            def remove_service(self, zc, type_, name) -> None:
-                nonlocal service_removed_count
-                service_removed_count += 1
-                if service_removed_count == 3:
+            def remove_service(self, zc, type_, name):
+                testCtx.service_removed_count += 1
+                if testCtx.service_removed_count == 3:
                     service_removed_event.set()
 
-        def mock_incoming_msg(
-            service_state_change: r.ServiceStateChange, service_type: str, service_name: str, ttl: int
-        ) -> r.DNSIncoming:
+        def mock_incoming_msg(service_state_change, service_type, service_name, ttl):
             generated = r.DNSOutgoing(r._FLAGS_QR_RESPONSE)
             generated.add_answer_at_time(
                 r.DNSPointer(service_type, r._TYPE_PTR, r._CLASS_IN, ttl, service_name), 0
@@ -1661,24 +1675,21 @@ class TestServiceBrowserMultipleTypes(unittest.TestCase):
                 mock_incoming_msg(r.ServiceStateChange.Added, service_types[2], service_names[2], 120)
             )
 
-            called_with_refresh_time_check = False
-
             def _mock_get_expiration_time(self, percent):
-                nonlocal called_with_refresh_time_check
                 if percent == _EXPIRE_REFRESH_TIME_PERCENT:
-                    called_with_refresh_time_check = True
+                    testCtx.called_with_refresh_time_check = True
                     return 0
                 return self.created + (percent * self.ttl * 10)
 
             # Set an expire time that will force a refresh
-            with unittest.mock.patch("zeroconf.DNSRecord.get_expiration_time", new=_mock_get_expiration_time):
+            with mock.patch("zeroconf.DNSRecord.get_expiration_time", new=_mock_get_expiration_time):
                 zeroconf.handle_response(
                     mock_incoming_msg(r.ServiceStateChange.Added, service_types[2], service_names[2], 120)
                 )
             service_add_event.wait(wait_time)
-            assert called_with_refresh_time_check is True
-            assert service_added_count == 3
-            assert service_removed_count == 0
+            assert testCtx.called_with_refresh_time_check is True
+            assert testCtx.service_added_count == 3
+            assert testCtx.service_removed_count == 0
 
             # all three services removed
             zeroconf.handle_response(
@@ -1691,8 +1702,8 @@ class TestServiceBrowserMultipleTypes(unittest.TestCase):
                 mock_incoming_msg(r.ServiceStateChange.Removed, service_types[2], service_names[2], 0)
             )
             service_removed_event.wait(wait_time)
-            assert service_added_count == 3
-            assert service_removed_count == 3
+            assert testCtx.service_added_count == 3
+            assert testCtx.service_removed_count == 3
 
         finally:
             assert len(zeroconf.listeners) == 1
@@ -1799,14 +1810,16 @@ def test_integration():
 
     expected_ttl = r._DNS_HOST_TTL
 
-    nbr_answers = 0
+    class TestCtx(object):
+        def __init__(self):
+            self.nbr_answers = 0
+    testCtx = TestCtx()
 
     def send(out, addr=r._MDNS_ADDR, port=r._MDNS_PORT):
         """Sends an outgoing packet."""
         pout = r.DNSIncoming(out.packet())
-        nonlocal nbr_answers
         for answer in pout.answers:
-            nbr_answers += 1
+            testCtx.nbr_answers += 1
             if not answer.ttl > expected_ttl / 2:
                 unexpected_ttl.set()
 
@@ -1842,7 +1855,7 @@ def test_integration():
         # is greater than half the original TTL
         sleep_count = 0
         test_iterations = 50
-        while nbr_answers < test_iterations:
+        while testCtx.nbr_answers < test_iterations:
             # Increase simulated time shift by 1/4 of the TTL in seconds
             time_offset += expected_ttl / 4
             zeroconf_browser.notify_all()
@@ -1924,6 +1937,8 @@ def test_multiple_addresses():
 
 def test_ptr_optimization():
 
+    print("XXX")
+
     # instantiate a zeroconf instance
     zc = Zeroconf(interfaces=['127.0.0.1'])
 
@@ -1940,24 +1955,28 @@ def test_ptr_optimization():
     # we are going to monkey patch the zeroconf send to check packet sizes
     old_send = zc.send
 
-    nbr_answers = nbr_additionals = nbr_authorities = 0
-    has_srv = has_txt = has_a = False
+    class TestCtx(object):
+        def __init__(self):
+            self.nbr_answers = 0
+            self.nbr_additionals = 0
+            self.nbr_authorities = 0
+            self.has_srv = False
+            self.has_txt = False
+            self.has_a = False
+    testCtx = TestCtx()
 
     def send(out, addr=r._MDNS_ADDR, port=r._MDNS_PORT):
         """Sends an outgoing packet."""
-        nonlocal nbr_answers, nbr_additionals, nbr_authorities
-        nonlocal has_srv, has_txt, has_a
-
-        nbr_answers += len(out.answers)
-        nbr_authorities += len(out.authorities)
+        testCtx.nbr_answers += len(out.answers)
+        testCtx.nbr_authorities += len(out.authorities)
         for answer in out.additionals:
-            nbr_additionals += 1
+            testCtx.nbr_additionals += 1
             if answer.type == r._TYPE_SRV:
-                has_srv = True
+                testCtx.has_srv = True
             elif answer.type == r._TYPE_TXT:
-                has_txt = True
+                testCtx.has_txt = True
             elif answer.type == r._TYPE_A:
-                has_a = True
+                testCtx.has_a = True
 
         old_send(out, addr=addr, port=port)
 
@@ -1966,14 +1985,14 @@ def test_ptr_optimization():
 
     # register
     zc.register_service(info)
-    nbr_answers = nbr_additionals = nbr_authorities = 0
+    testCtx.nbr_answers = testCtx.nbr_additionals = testCtx.nbr_authorities = 0
 
     # query
     query = r.DNSOutgoing(r._FLAGS_QR_QUERY | r._FLAGS_AA)
     query.add_question(r.DNSQuestion(info.type, r._TYPE_PTR, r._CLASS_IN))
     zc.handle_query(r.DNSIncoming(query.packet()), r._MDNS_ADDR, r._MDNS_PORT)
-    assert nbr_answers == 1 and nbr_additionals == 3 and nbr_authorities == 0
-    assert has_srv and has_txt and has_a
+    assert testCtx.nbr_answers == 1 and testCtx.nbr_additionals == 3 and testCtx.nbr_authorities == 0
+    assert testCtx.has_srv and testCtx.has_txt and testCtx.has_a
 
     # unregister
     zc.unregister_service(info)
