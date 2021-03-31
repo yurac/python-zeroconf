@@ -31,13 +31,13 @@ import select
 import socket
 import struct
 import sys
-import threading
 import time
 import warnings
 from collections import OrderedDict
 from six import indexbytes, int2byte, u
 
 import ifaddr
+import bluelet
 
 __author__ = 'Paul Scott-Murphy, William McBrine'
 __maintainer__ = 'Jakub Stasiak <jakub@stasiak.at>'
@@ -201,6 +201,9 @@ class IPVersion(enum.Enum):
 def current_time_millis():
     """Current system time in milliseconds"""
     return time.time() * 1000
+
+def millis_to_seconds(millis):
+    return millis / 1000.0
 
 def ip_address_from_str(str):
     return ipaddress.ip_address(u(str))
@@ -496,7 +499,7 @@ class DNSRecord(DNSEntry):
     # TODO: Switch to just int here
     def get_remaining_ttl(self, now):
         """Returns the remaining TTL in seconds."""
-        return max(0, (self._expiration_time - now) / 1000.0)
+        return max(0, millis_to_seconds(self._expiration_time - now))
 
     def is_expired(self, now):
         """Returns true if this record has expired."""
@@ -1272,88 +1275,11 @@ class DNSCache:
         """
         return itertools.chain.from_iterable(self.cache.values())
 
-class Engine(threading.Thread):
-
-    """An engine wraps read access to sockets, allowing objects that
-    need to receive data from sockets to be called back when the
-    sockets are ready.
-
-    A reader needs a handle_read() method, which is called when the socket
-    it is interested in is ready for reading.
-
-    Writers are not implemented here, because we only send short
-    packets.
-    """
-
-    def __init__(self, zc):
-        threading.Thread.__init__(self)
-        self.daemon = True
-        self.zc = zc
-        self.readers = {}
-        self.timeout = 5
-        self.condition = threading.Condition()
-        self.socketpair = socket.socketpair()
-        self.start()
-        self.name = "zeroconf-Engine-%s" % (getattr(self, 'native_id', self.ident),)
-
-    def run(self):
-        while not self.zc.done:
-            with self.condition:
-                rs = list(self.readers.keys())
-                if len(rs) == 0:
-                    # No sockets to manage, but we wait for the timeout
-                    # or addition of a socket
-                    self.condition.wait(self.timeout)
-
-            if len(rs) != 0:
-                try:
-                    rs = rs + [self.socketpair[0]]
-                    rr, wr, er = select.select(rs, [], [], self.timeout)
-                    if not self.zc.done:
-                        for socket_ in rr:
-                            reader = self.readers.get(socket_)
-                            if reader:
-                                reader.handle_read(socket_)
-
-                        if self.socketpair[0] in rr:
-                            # Clear the socket's buffer
-                            self.socketpair[0].recv(128)
-
-                except (select.error, socket.error) as e:
-                    # If the socket was closed by another thread, during
-                    # shutdown, ignore it and exit
-                    if e.args[0] not in (errno.EBADF, errno.ENOTCONN) or not self.zc.done:
-                        raise
-        self.socketpair[0].close()
-        self.socketpair[1].close()
-
-    def _notify(self):
-        self.condition.notify()
-        try:
-            self.socketpair[1].send(b'x')
-        except socket.error:
-            # The socketpair may already be closed during shutdown, ignore it
-            if not self.zc.done:
-                raise
-
-    def add_reader(self, reader, socket_):
-        with self.condition:
-            self.readers[socket_] = reader
-            self._notify()
-
-    def del_reader(self, socket_):
-        with self.condition:
-            del self.readers[socket_]
-            self._notify()
-
 class Listener(QuietLogger):
 
     """A Listener is used by this module to listen on the multicast
     group to which DNS messages are sent, allowing the implementation
-    to cache information as it arrives.
-
-    It requires registration with an Engine object in order to have
-    the read() method called when a socket is available for reading."""
+    to cache information as it arrives"""
 
     def __init__(self, zc):
         self.zc = zc
@@ -1415,44 +1341,7 @@ class Listener(QuietLogger):
                 self.zc.handle_query(msg, None, _MDNS_PORT)
 
         else:
-            self.zc.handle_response(msg)
-
-class Reaper(threading.Thread):
-
-    """A Reaper is used by this module to remove cache entries that
-    have expired."""
-
-    def __init__(self, zc):
-        threading.Thread.__init__(self)
-        self.daemon = True
-        self.zc = zc
-        self.start()
-        self.name = "zeroconf-Reaper_%s" % (getattr(self, 'native_id', self.ident),)
-
-    def run(self):
-        """Perodic removal of expired entries from the cache."""
-        while True:
-            with self.zc.reaper_condition:
-                self.zc.reaper_condition.wait(10)
-
-            if self.zc.done:
-                return
-            try:
-                # We try to iterate the cache without copying the whole
-                # cache as this can be quite an expensive operation.
-                self._cleanup_cache(self.zc.cache.iterable_entries())
-            except RuntimeError:
-                # If the cache changes during iteration, we fallback
-                # to making a copy before iteraiton.
-                self._cleanup_cache(self.zc.cache.entries())
-
-    def _cleanup_cache(self, entries):
-        """Remove expired entries from the cache."""
-        now = current_time_millis()
-        for record in entries:
-            if record.is_expired(now):
-                self.zc.update_record(now, record)
-                self.zc.cache.remove(record)
+            yield self.zc.handle_response(msg)
 
 class Signal:
     def __init__(self):
@@ -1460,7 +1349,7 @@ class Signal:
 
     def fire(self, **kwargs):
         for h in list(self._handlers):
-            h(**kwargs)
+            yield h(**kwargs)
 
     @property
     def registration_interface(self):
@@ -1492,7 +1381,7 @@ class ServiceListener:
     def update_service(self, zc, type_, name):
         raise NotImplementedError()
 
-class ServiceBrowser(RecordUpdateListener, threading.Thread):
+class ServiceBrowser(RecordUpdateListener):
 
     """Used to browse for a service of a specific type.
 
@@ -1507,8 +1396,6 @@ class ServiceBrowser(RecordUpdateListener, threading.Thread):
         for check_type_ in self.types:
             if not check_type_.endswith(service_type_name(check_type_, strict=False)):
                 raise BadTypeInNameException
-        threading.Thread.__init__(self)
-        self.daemon = True
         self.zc = zc
         self.addr = addr
         self.port = port
@@ -1537,12 +1424,12 @@ class ServiceBrowser(RecordUpdateListener, threading.Thread):
                 assert listener is not None
                 args = (zeroconf, service_type, name)
                 if state_change is ServiceStateChange.Added:
-                    listener.add_service(*args)
+                    yield listener.add_service(*args)
                 elif state_change is ServiceStateChange.Removed:
-                    listener.remove_service(*args)
+                    yield listener.remove_service(*args)
                 elif state_change is ServiceStateChange.Updated:
                     if hasattr(listener, 'update_service'):
-                        listener.update_service(*args)
+                        yield listener.update_service(*args)
                     else:
                         warnings.warn(
                             "%r has no update_service method. Provide one (it can be empty if you "
@@ -1556,8 +1443,6 @@ class ServiceBrowser(RecordUpdateListener, threading.Thread):
 
         for h in handlers:
             self.service_state_changed.register_handler(h)
-
-        self.start()
 
     @property
     def service_state_changed(self):
@@ -1643,23 +1528,23 @@ class ServiceBrowser(RecordUpdateListener, threading.Thread):
                 if record.name.endswith(type_):
                     enqueue_callback(ServiceStateChange.Updated, type_, record.name)
 
-    def cancel(self):
-        self.done = True
-        self.zc.remove_listener(self)
-        self.join()
+    def start(self):
+        self.handle = yield bluelet.spawn(self.browse())
 
-    def run(self):
+    def cancel(self):
+        yield bluelet.kill(self.handle)
+        self.zc.remove_listener(self)
+
+    def browse(self):
         questions = [DNSQuestion(type_, _TYPE_PTR, _CLASS_IN) for type_ in self.types]
-        self.zc.add_listener(self, questions)
+        yield self.zc.add_listener(self, questions)
 
         while True:
             now = current_time_millis()
             # Wait for the type has the smallest next time
             next_time = min(self._next_time.values())
             if len(self._handlers_to_call) == 0 and next_time > now:
-                self.zc.wait(next_time - now)
-            if self.zc.done or self.done:
-                return
+                yield bluelet.sleep(millis_to_seconds(next_time - now))
             now = current_time_millis()
             for type_ in self.types:
                 if self._next_time[type_] > now:
@@ -1674,10 +1559,9 @@ class ServiceBrowser(RecordUpdateListener, threading.Thread):
                 self._next_time[type_] = now + self._delay[type_]
                 self._delay[type_] = min(_BROWSER_BACKOFF_LIMIT * 1000, self._delay[type_] * 2)
 
-            if len(self._handlers_to_call) > 0 and not self.zc.done:
-                with self.zc._handlers_lock:
-                    (name, service_type_state_change) = self._handlers_to_call.popitem(False)
-                self._service_state_changed.fire(
+            if len(self._handlers_to_call) > 0:
+                (name, service_type_state_change) = self._handlers_to_call.popitem(False)
+                yield self._service_state_changed.fire(
                     zeroconf=self.zc,
                     service_type=service_type_state_change[0],
                     name=name,
@@ -1863,8 +1747,8 @@ class ServiceInfo(RecordUpdateListener):
                     self.weight = record.weight
                     self.priority = record.priority
                     # self.address = None
-                    self.update_record(zc, now, zc.cache.get_by_details(self.server, _TYPE_A, _CLASS_IN))
-                    self.update_record(zc, now, zc.cache.get_by_details(self.server, _TYPE_AAAA, _CLASS_IN))
+                    yield self.update_record(zc, now, zc.cache.get_by_details(self.server, _TYPE_A, _CLASS_IN))
+                    yield self.update_record(zc, now, zc.cache.get_by_details(self.server, _TYPE_AAAA, _CLASS_IN))
             elif record.type == _TYPE_TXT:
                 assert isinstance(record, DNSText)
                 if record.name == self.name:
@@ -1886,16 +1770,16 @@ class ServiceInfo(RecordUpdateListener):
         for record_type in record_types_for_check_cache:
             cached = zc.cache.get_by_details(self.name, *record_type)
             if cached:
-                self.update_record(zc, now, cached)
+                yield self.update_record(zc, now, cached)
 
         if self.server is not None and self.text is not None and self._addresses:
-            return True
+            yield bluelet.end(True)
 
         try:
-            zc.add_listener(self, DNSQuestion(self.name, _TYPE_ANY, _CLASS_IN))
+            yield zc.add_listener(self, DNSQuestion(self.name, _TYPE_ANY, _CLASS_IN))
             while self.server is None or self.text is None or not self._addresses:
                 if last <= now:
-                    return False
+                    yield bluelet.end(False)
                 if next_ <= now:
                     out = DNSOutgoing(_FLAGS_QR_QUERY)
                     cached_entry = zc.cache.get_by_details(self.name, _TYPE_SRV, _CLASS_IN)
@@ -1920,12 +1804,12 @@ class ServiceInfo(RecordUpdateListener):
                     next_ = now + delay
                     delay *= 2
 
-                zc.wait(min(next_, last) - now)
+                yield bluelet.sleep(millis_to_seconds(min(next_, last) - now))
                 now = current_time_millis()
         finally:
             zc.remove_listener(self)
 
-        return True
+        yield bluelet.end(True)
 
     def __eq__(self, other):
         """Tests equality of service name"""
@@ -1953,47 +1837,6 @@ class ServiceInfo(RecordUpdateListener):
                 )
             ),
         )
-
-class ZeroconfServiceTypes(ServiceListener):
-    """
-    Return all of the advertised services on any local networks
-    """
-
-    def __init__(self):
-        self.found_services = set()
-
-    def add_service(self, zc, type_, name):
-        self.found_services.add(name)
-
-    def remove_service(self, zc, type_, name):
-        pass
-
-    @classmethod
-    def find(cls, zc=None, timeout=5, interfaces=InterfaceChoice.All, ip_version=None):
-        """
-        Return all of the advertised services on any local networks.
-
-        :param zc: Zeroconf() instance.  Pass in if already have an
-                instance running or if non-default interfaces are needed
-        :param timeout: seconds to wait for any responses
-        :param interfaces: interfaces to listen on.
-        :param ip_version: IP protocol version to use.
-        :return: tuple of service type strings
-        """
-        local_zc = zc or Zeroconf(interfaces=interfaces, ip_version=ip_version)
-        listener = cls()
-        browser = ServiceBrowser(local_zc, '_services._dns-sd._udp.local.', listener=listener)
-
-        # wait for responses
-        time.sleep(timeout)
-
-        # close down anything we opened
-        if zc is None:
-            local_zc.close()
-        else:
-            browser.cancel()
-
-        return tuple(sorted(listener.found_services))
 
 def get_all_addresses():
     return list(set(addr.ip for iface in ifaddr.get_adapters() for addr in iface.ips if addr.is_IPv4))
@@ -2251,29 +2094,14 @@ class ServiceRegistry:
 
     def __init__(self):
         """Create the ServiceRegistry class."""
-        self.services = {}  # type: Dict[str, ServiceInfo]
-        self.types = {}  # type: Dict[str, List]
-        self.servers = {}  # type: Dict[str, List]
-        self._lock = threading.Lock()  # add and remove services thread safe
-
-    def add(self, info):
-        """Add a new service to the registry."""
-
-        with self._lock:
-            self._add(info)
-
-    def remove(self, info):
-        """Remove a new service from the registry."""
-
-        with self._lock:
-            self._remove(info)
+        self.services = {}
+        self.types = {}
+        self.servers = {}
 
     def update(self, info):
         """Update new service in the registry."""
-
-        with self._lock:
-            self._remove(info)
-            self._add(info)
+        self.remove(info)
+        self.add(info)
 
     def get_service_infos(self):
         """Return all ServiceInfo."""
@@ -2310,8 +2138,7 @@ class ServiceRegistry:
 
         return service_infos
 
-    def _add(self, info):
-        """Add a new service under the lock."""
+    def add(self, info):
         lower_name = info.name.lower()
         if lower_name in self.services:
             raise ServiceNameAlreadyRegistered
@@ -2320,8 +2147,7 @@ class ServiceRegistry:
         self.types.setdefault(info.type, []).append(lower_name)
         self.servers.setdefault(info.server, []).append(lower_name)
 
-    def _remove(self, info):
-        """Remove a service under the lock."""
+    def remove(self, info):
         lower_name = info.name.lower()
         old_service_info = self.services[lower_name]
         self.types[old_service_info.type].remove(lower_name)
@@ -2385,53 +2211,49 @@ class Zeroconf(QuietLogger):
 
         self.cache = DNSCache()
 
-        self.condition = threading.Condition()
-        self.reaper_condition = threading.Condition()
-
-        # Ensure we create the lock before
-        # we add the listener as we could get
-        # a message before the lock is created.
-        self._handlers_lock = threading.Lock()  # ensure we process a full message in one go
-
-        self.engine = Engine(self)
         self.listener = Listener(self)
-        if not unicast:
-            self.engine.add_reader(self.listener, self._listen_socket)
+        self.debug = None
+        self.tasks = []
+
+    def task(self, t):
+        handle = yield bluelet.spawn(t)
+        self.tasks.append(handle)
+
+    def start(self):
+        yield self.task(self.reaper())
+
+        if not self.unicast:
+            yield self.task(self.reader(self._listen_socket))
         if self.multi_socket:
             for s in self._respond_sockets:
-                self.engine.add_reader(self.listener, s)
-        self.reaper = Reaper(self)
+                yield self.task(self.reader(s))
 
-        self.debug = None
+    def reader(self, sock):
+        while True:
+            yield bluelet.ReadableEvent(sock)
+            yield self.listener.handle_read(sock)
+
+    def reaper(self):
+        while True:
+            yield bluelet.sleep(10)
+            now = current_time_millis()
+            for record in self.cache.entries():
+                if record.is_expired(now):
+                    yield self.update_record(now, record)
+                    self.cache.remove(record)
 
     @property
     def done(self):
         return self._GLOBAL_DONE
-
-    def wait(self, timeout):
-        """Calling thread waits for a given number of milliseconds or
-        until notified."""
-        with self.condition:
-            self.condition.wait(timeout / 1000.0)
-
-    def notify_all(self):
-        """Notifies all waiting threads"""
-        with self.condition:
-            self.condition.notify_all()
-
-    def notify_reaper(self):
-        """Notifies reaper"""
-        with self.reaper_condition:
-            self.reaper_condition.notify_all()
 
     def get_service_info(self, type_, name, timeout=3000):
         """Returns network's service information for a particular
         name and type, or None if no service matches by the timeout,
         which defaults to 3 seconds."""
         info = ServiceInfo(type_, name)
-        if info.request(self, timeout):
-            return info
-        return None
+        res = yield info.request(self, timeout)
+        if res:
+            yield bluelet.end(info)
 
     def add_service_listener(self, type_, listener):
         """Adds a listener for a particular service type.  This object
@@ -2463,9 +2285,9 @@ class Zeroconf(QuietLogger):
             # Setting TTLs via ServiceInfo is preferred
             info.host_ttl = ttl
             info.other_ttl = ttl
-        self.check_service(info, allow_name_change, cooperating_responders)
+        yield self.check_service(info, allow_name_change, cooperating_responders)
         self.registry.add(info)
-        self._broadcast_service(info, _REGISTER_TIME, None)
+        yield self._broadcast_service(info, _REGISTER_TIME, None)
 
     def update_service(self, info):
         """Registers service information to the network with a default TTL.
@@ -2473,7 +2295,7 @@ class Zeroconf(QuietLogger):
         service."""
 
         self.registry.update(info)
-        self._broadcast_service(info, _REGISTER_TIME, None)
+        yield self._broadcast_service(info, _REGISTER_TIME, None)
 
     def _broadcast_service(self, info, interval, ttl):
         now = current_time_millis()
@@ -2481,7 +2303,7 @@ class Zeroconf(QuietLogger):
         i = 0
         while i < 3:
             if now < next_time:
-                self.wait(next_time - now)
+                yield bluelet.sleep(millis_to_seconds(next_time - now))
                 now = current_time_millis()
                 continue
 
@@ -2522,7 +2344,7 @@ class Zeroconf(QuietLogger):
     def unregister_service(self, info):
         """Unregister a service."""
         self.registry.remove(info)
-        self._broadcast_service(info, _UNREGISTER_TIME, 0)
+        yield self._broadcast_service(info, _UNREGISTER_TIME, 0)
 
     def unregister_all_services(self):
         """Unregister all registered services."""
@@ -2534,7 +2356,7 @@ class Zeroconf(QuietLogger):
         i = 0
         while i < 3:
             if now < next_time:
-                self.wait(next_time - now)
+                yield bluelet.sleep(millis_to_seconds(next_time - now))
                 now = current_time_millis()
                 continue
             out = DNSOutgoing(_FLAGS_QR_RESPONSE | _FLAGS_AA)
@@ -2565,7 +2387,7 @@ class Zeroconf(QuietLogger):
                 # check for a name conflict
                 while self.cache.current_entry_with_name_and_alias(info.type, info.name):
                     if not allow_name_change:
-                        raise NonUniqueNameException
+                        yield bluelet.ExceptionEvent(NonUniqueNameException)
 
                     # change the name and look for a conflict
                     info.name = '%s-%s.%s' % (instance_name, next_instance_number, info.type)
@@ -2575,7 +2397,7 @@ class Zeroconf(QuietLogger):
                     i = 0
 
             if now < next_time:
-                self.wait(next_time - now)
+                yield bluelet.sleep(millis_to_seconds(next_time - now))
                 now = current_time_millis()
                 continue
 
@@ -2598,14 +2420,12 @@ class Zeroconf(QuietLogger):
             for single_question in questions:
                 for record in self.cache.entries_with_name(single_question.name):
                     if single_question.answered_by(record) and not record.is_expired(now):
-                        listener.update_record(self, now, record)
-        self.notify_all()
+                        yield listener.update_record(self, now, record)
 
     def remove_listener(self, listener):
         """Removes a listener."""
         try:
             self.listeners.remove(listener)
-            self.notify_all()
         except Exception as e:  # TODO stop catching all Exceptions
             log.exception('Unknown error, possibly benign: %r', e)
 
@@ -2613,8 +2433,7 @@ class Zeroconf(QuietLogger):
         """Used to notify listeners of new information that has updated
         a record."""
         for listener in self.listeners:
-            listener.update_record(self, now, rec)
-        self.notify_all()
+            yield listener.update_record(self, now, rec)
 
     def handle_response(self, msg):
         """Deal with incoming response packets.  All answers
@@ -2658,13 +2477,11 @@ class Zeroconf(QuietLogger):
         if not updates:
             return
 
-        # Only hold the lock if we have updates
-        with self._handlers_lock:
-            for update in updates:
-                now, record, entry_to_remove = update
-                self.update_record(update[0], update[1])
-                if entry_to_remove:
-                    self.cache.remove(entry_to_remove)
+        for update in updates:
+            now, record, entry_to_remove = update
+            yield self.update_record(update[0], update[1])
+            if entry_to_remove:
+                self.cache.remove(entry_to_remove)
 
     def handle_query(self, msg, addr, port):
         """Deal with incoming query packets.  Provides a response if
@@ -2844,23 +2661,20 @@ class Zeroconf(QuietLogger):
         """Ends the background threads, and prevent this instance from
         servicing further queries."""
         if not self._GLOBAL_DONE:
+
+            # Kill all background tasks
+            for t in self.tasks:
+                yield bluelet.kill(t)
+
             # remove service listeners
             self.remove_all_service_listeners()
-            self.unregister_all_services()
+            yield self.unregister_all_services()
             self._GLOBAL_DONE = True
 
             # shutdown recv socket and thread
             if not self.unicast:
-                self.engine.del_reader(self._listen_socket)
                 self._listen_socket.close()
-            if self.multi_socket:
-                for s in self._respond_sockets:
-                    self.engine.del_reader(s)
-            self.engine.join()
 
             # shutdown the rest
-            self.notify_all()
-            self.notify_reaper()
-            self.reaper.join()
             for s in self._respond_sockets:
                 s.close()
